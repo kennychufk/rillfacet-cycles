@@ -188,7 +188,7 @@ class CyclesRenderer(Renderer):
                  device="OPTIX", env_spacing=50.0, sun_angle=0.53,
                  oversample=1.0, supersample=3, seed=0, quiet=True,
                  tmpdir=None):
-        super().__init__(env_spacing=env_spacing)
+        super().__init__(env_spacing=env_spacing, seed=seed)
         import torch
         with _quiet(quiet):           # Cycles' HIP probe warns on NVIDIA hosts
             import bpy
@@ -765,8 +765,7 @@ class CyclesRenderer(Renderer):
             lin = F.grid_sample(img, g, mode="bilinear", padding_mode="border",
                                 align_corners=False).mean(-1)   # [I, 3, HW]
             lin = lin.reshape(I, 3, H, W).permute(0, 2, 3, 1).clamp(min=0)
-            lin = lin * torch.as_tensor(cam.gain, device=self.dev).float()[
-                :, None, None, :]
+            lin = self.sensor_image(cam, lin)
             if "linear" in outputs:
                 out["linear"] = lin
             if "rgb" in outputs:

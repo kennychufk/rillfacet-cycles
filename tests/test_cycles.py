@@ -160,6 +160,28 @@ def test_depth_of_field_blurs(renderer):
     assert band[1] > 3 * band[0]
 
 
+def test_vignetting_and_noise(renderer):
+    """Cycles' radiance goes through rillfacet's shared sensor stage."""
+    from rillfacet.render.sensor import radius2
+    _fresh(renderer)
+    s, _ = _scene(renderer, instances=3, cube_x=(30.0, 30.0, 30.0))
+    W, H = 48, 36
+    K = _pinhole(W, H, 30.0)
+    s.camera_sensor("top", W, H, K, instances=3,
+                    local_pose=look_at((0, 0, 3.0), (0, 0, 0), up=(0, 1, 0)),
+                    vignetting=[0.0, 0.5, 0.0], read_noise=[0.0, 0.0, 0.05])
+    lin = renderer.render("top", outputs=("linear",), spp=16)["linear"]
+    lin = lin.mean(-1).cpu()
+    r2 = radius2(K, W, H)
+    ratio = lin[1] / lin[0]
+    corner = r2 > 0.7
+    assert float(ratio[r2 < 0.05].mean()) == pytest.approx(1.0, abs=0.03)
+    assert float(ratio[corner].mean()) == pytest.approx(
+        float((1 - 0.5 * r2[corner]).mean()), abs=0.03)
+    extra = float(lin[2].var() - lin[0].var())
+    assert extra == pytest.approx(0.05 ** 2 / 3, rel=0.25)
+
+
 def test_matches_mitsuba():
     """Same scene, same distorted camera: Cycles' resampled proxy and
     Mitsuba's exact rays agree on depth and labels."""
