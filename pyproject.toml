@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rillfacet-cycles"
+version = "0.1.0"
+description = "Blender Cycles camera renderer backend for rillfacet scenes (vision RL, synthetic data)"
+requires-python = ">=3.11"
+readme = "README.md"
+# bpy (Blender as a Python module) is GPL-3.0-or-later; so is this package.
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Kenny Chu", email = "kennychu@riec.tohoku.ac.jp" }]
+dependencies = ["rillfacet", "bpy>=4.2", "numpy", "torch", "pillow"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["python"]
