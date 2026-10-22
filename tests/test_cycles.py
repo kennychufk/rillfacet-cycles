@@ -143,6 +143,23 @@ def test_instance_materials_and_texture_tint(renderer):
     assert bright.mean() > 0.2 and (~bright).mean() > 0.2
 
 
+def test_appearance_changes_between_renders(renderer):
+    """New per-instance materials reach Cycles' persistent session (object
+    attributes written from Python must be tagged)."""
+    _fresh(renderer)
+    s, rm = _scene(renderer)
+    W, H = 16, 16
+    s.camera_sensor("top", W, H, _pinhole(W, H, 10.0), instances=2,
+                    local_pose=look_at((0, 0, 3.0), (0, 0, 0), up=(0, 1, 0)))
+    c = (0, H // 2, W // 2)
+    r0, g0, b0 = renderer.render("top")["rgb"][c].tolist()
+    col = rm.material_base_color.copy()
+    col[:, 0] = (0.1, 0.1, 0.9)
+    rm.set_materials(base_color=col)
+    r1, g1, b1 = renderer.render("top")["rgb"][c].tolist()
+    assert r0 > 2 * b0 and b1 > 2 * r1
+
+
 def test_depth_of_field_blurs(renderer):
     """A wide aperture focused far from the cube widens the band of mixed
     cube / ground pixels along its outline."""
@@ -204,3 +221,239 @@ def test_matches_mitsuba():
     assert (sc == sm).mean() > 0.97
     both = (sc == sm) & (sc >= 0)
     assert np.median(np.abs(dc - dm)[both]) < 2e-3
+
+
+# -- solid (3D) textures --------------------------------------------------------
+
+def _osl_eval(r, points, rows):
+    """``solid_texture.osl`` evaluated by Cycles at body-local ``points``
+    ``[n, T * T, 3]`` (in the plane z = const per n) with rows ``[n, K]``:
+    ``(h, rough, linear rgb)``, each ``[n, T * T(, 3)]``. One object per
+    row, a T x T pixel tile of an orthographic view, emitting the shader's
+    outputs at the pixel centers."""
+    import os
+    from rillfacet.solid_texture import linearize
+    n, TT, _ = points.shape
+    T, G = int(round(TT ** 0.5)), int(np.ceil(np.sqrt(n)))
+    px = 0.01                                          # m per pixel
+    sc = bpy.data.scenes.new("rf_test_osl")
+    blocks = []
+    try:
+        sc.render.engine = "CYCLES"
+        c = sc.cycles
+        c.device, c.shading_system = r._device, True
+        c.samples, c.filter_width, c.max_bounces = 1, 0.01, 0
+        c.use_denoising = c.use_adaptive_sampling = False
+        sc.render.resolution_x = sc.render.resolution_y = G * T
+        sc.render.resolution_percentage = 100
+        sc.render.image_settings.file_format = "OPEN_EXR"
+        sc.render.image_settings.color_depth = "32"
+        sc.view_settings.view_transform = "Standard"
+        cam = bpy.data.cameras.new("rf_test_cam")
+        cam.type, cam.ortho_scale = "ORTHO", G * T * px
+        cob = bpy.data.objects.new("rf_test_cam", cam)
+        cob.location = (G * T * px / 2, G * T * px / 2, 5.0)
+        sc.collection.objects.link(cob)
+        sc.camera = cob
+        sc.world = bpy.data.worlds.new("rf_test_world")
+        mat = bpy.data.materials.new("rf_test_mat")
+        nt = mat.node_tree
+        nt.nodes.clear()
+        st = r._solid_texture_node(nt, 0, False)
+        em = nt.nodes.new("ShaderNodeEmission")
+        nt.links.new(em.outputs[0],
+                     nt.nodes.new("ShaderNodeOutputMaterial").inputs["Surface"])
+        blocks += [cam, cob, sc.world, mat]
+        lin = linearize(rows).reshape(n, 8, 4)
+        lo = points[:, :, :2].min(1)                   # tile corner, body-local
+        for k in range(n):
+            gx, gy = k % G, k // G
+            z = float(points[k, 0, 2])
+            x0, y0 = lo[k] - 0.5 * px
+            me = bpy.data.meshes.new(f"rf_test_q{k}")
+            s = T * px
+            me.from_pydata([(x0, y0, z), (x0 + s, y0, z), (x0 + s, y0 + s, z),
+                            (x0, y0 + s, z)], [], [(0, 1, 2, 3)])
+            me.materials.append(mat)
+            ob = bpy.data.objects.new(f"rf_test_q{k}", me)
+            ob.location = (gx * s - x0, gy * s - y0, -z)
+            for j in range(8):
+                ob[f"rf_s0_{j}"] = lin[k, j].tolist()
+            sc.collection.objects.link(ob)
+            blocks += [ob, me]
+        comb = nt.nodes.new("ShaderNodeCombineXYZ")
+        nt.links.new(st.outputs["Height"], comb.inputs[0])
+        nt.links.new(st.outputs["Roughness"], comb.inputs[1])
+        imgs = []
+        for out in (st.outputs["Color"], comb.outputs[0]):
+            nt.links.new(out, em.inputs["Color"])
+            sc.render.filepath = os.path.join(r._tmp, "osl_test.exr")
+            bpy.ops.render.render(write_still=True, scene=sc.name)
+            img = bpy.data.images.load(sc.render.filepath, check_existing=False)
+            img.colorspace_settings.name = "Non-Color"
+            a = np.empty(G * T * G * T * 4, np.float32)
+            img.pixels.foreach_get(a)
+            bpy.data.images.remove(img)
+            # row 0 = bottom: tile (gx, gy), pixel (u, v) at y-up order
+            a = a.reshape(G, T, G, T, 4).transpose(0, 2, 1, 3, 4)
+            imgs.append(a.reshape(G * G, T * T, 4)[:n, :, :3])
+        return imgs[1][..., 0], imgs[1][..., 1], imgs[0]
+    finally:
+        # objects first (removing their data would remove them)
+        blocks.sort(key=lambda b: not isinstance(b, bpy.types.Object))
+        for b in blocks:
+            {bpy.types.Object: bpy.data.objects, bpy.types.Mesh: bpy.data.meshes,
+             bpy.types.Camera: bpy.data.cameras, bpy.types.World: bpy.data.worlds,
+             bpy.types.Material: bpy.data.materials}[type(b)].remove(b)
+        bpy.data.scenes.remove(sc)
+
+
+def test_solid_texture_osl_matches_the_reference(renderer):
+    """The OSL port evaluates the same functions as the torch reference
+    (rillfacet.solid_texture.evaluate), every family, random rows and
+    points (in body-local planes z = const)."""
+    from rillfacet import solid_texture as sx
+    rng = np.random.default_rng(0)
+    n, T, px = 64, 16, 0.01
+    rows = sx.sample_params(rng, n, families=sx.FAMILIES)
+    rows[:, sx.PARAM["rough0"]], rows[:, sx.PARAM["rough1"]] = 0.2, 0.9
+    corner = rng.uniform(-0.3, 0.1, (n, 1, 2))
+    u, v = np.meshgrid(np.arange(T), np.arange(T), indexing="xy")
+    uv = (np.stack([u, v], -1).reshape(1, -1, 2) + 0.5) * px
+    pts = np.concatenate([corner + uv, np.broadcast_to(
+        rng.uniform(-0.3, 0.3, (n, 1, 1)), (n, T * T, 1))], -1)
+    h, rough, rgb = _osl_eval(renderer, pts.astype(np.float32), rows)
+    got = torch.as_tensor(np.concatenate([h[..., None], rgb], -1)).reshape(-1, 4)
+    pt = torch.as_tensor(pts, dtype=torch.float32).reshape(-1, 3)
+    rt = torch.as_tensor(np.repeat(rows, T * T, 0))
+    hr, cr = sx.evaluate(pt, rt)
+    want = torch.cat([hr[:, None], cr], -1)
+    err = (got - want).abs().max(-1).values
+    fam = rt[:, sx.PARAM["family"]]
+    for f, name in enumerate(sx.FAMILIES):
+        e = err[fam == f]
+        assert len(e), name
+        # granite / checker: rare ties at cell boundaries pick another cell
+        assert float((e > 1e-3).float().mean()) < 2e-3, name
+        assert float(e.median()) < 1e-5, name
+    assert np.allclose(rough, 0.2 + 0.7 * h, atol=1e-5)
+
+
+def _solid_scene(renderer, solid, *, bump=False, instances=2,
+                 cube_x=(0.0, 0.0)):
+    """``_scene`` with both slots solid-texture slots (or not)."""
+    bv, bt = _box()
+    gv = np.array([[-5, -5, 0], [5, -5, 0], [5, 5, 0], [-5, 5, 0]], np.float32)
+    gt = np.array([[0, 1, 2], [0, 2, 3]]) + len(bv)
+    s = Scene(renderer)
+    rm = s.rigid_mesh(
+        "world", np.concatenate([bv, gv]),
+        np.r_[np.zeros(len(bv), int), np.ones(4, int)], np.concatenate([bt, gt]),
+        np.array([0, len(bt), len(bt) + 2]), instances=instances,
+        body_names=["cube", "ground"],
+        materials=[Material(n, solid_texture=solid, bump=bump and solid)
+                   for n in ("a", "b")],
+        triangle_material=np.r_[np.zeros(len(bt), int), np.ones(2, int)])
+    poses = np.zeros((instances, 2, 7), np.float32)
+    poses[..., 6] = 1.0
+    poses[:, 0, 0] = cube_x[:instances]
+    rm.set_poses(poses)
+    return s, rm
+
+
+def test_plain_solid_rows_render_like_ordinary_materials(renderer):
+    """Solid-texture slots with plain rows of each env's color and
+    roughness render the image of ordinary materials with those values (the
+    (env, slot) -> row mapping, sRGB, roughness, metallic; OSL vs SVM)."""
+    from rillfacet import solid_texture as sx
+    rng = np.random.default_rng(1)
+    col = rng.uniform(0, 1, (2, 2, 3))
+    rough = rng.uniform(0.2, 1, (2, 2))
+    metal = rng.uniform(0, 1, (2, 2))
+    imgs = []
+    for solid in (False, True):
+        _fresh(renderer)
+        s, rm = _solid_scene(renderer, solid)
+        rm.set_materials(base_color=col, roughness=rough, metallic=metal)
+        if solid:
+            rm.set_materials(solid_texture=np.stack([[
+                sx.make_params("plain", colors=(col[e, k],),
+                               roughness=rough[e, k])
+                for k in range(2)] for e in range(2)]))
+        W, H = 48, 36
+        s.camera_sensor("cam", W, H, _pinhole(W, H, 30.0), instances=2,
+                        local_pose=look_at((1.5, -2.0, 2.5), (0, 0, 0.3),
+                                           up=(0, 0, 1)))
+        renderer._seed = 0                       # the same samples
+        imgs.append(renderer.render("cam", outputs=("linear",),
+                                    spp=16)["linear"])
+    a, b = imgs
+    assert float((a - b).abs().mean()) < 2e-3
+    assert float((a - b).abs().amax(-1).quantile(0.99)) < 2e-2
+
+
+def test_solid_texture_bump_follows_the_height(renderer):
+    """A bumped white floor, rotated and moved, under the sun: the radiance
+    ratio bumped / flat follows the cosine ratio predicted from the
+    reference's height gradient at the body-local hit points."""
+    from rillfacet import solid_texture as sx
+    from rillfacet.render.mitsuba import _qrot
+    _fresh(renderer)
+    s, rm = _solid_scene(renderer, True, bump=True, instances=1,
+                         cube_x=(30.0,))
+    ang = 0.7
+    q = np.array([0, 0, np.sin(ang / 2), np.cos(ang / 2)], np.float32)
+    shift = np.array([0.3, -0.2, 0.0], np.float32)
+    poses = rm.poses.copy() if not hasattr(rm.poses, "detach") \
+        else rm.poses.cpu().numpy().copy()
+    poses = poses.reshape(1, 2, 7)
+    poses[0, 1, :3], poses[0, 1, 3:] = shift, q
+    rm.set_poses(poses)
+    sun = np.array([0.6, 0.3, 0.75])
+    s.light("sun", "directional", direction=-sun, intensity=3.0)
+    W = H = 96
+    f = 120.0
+    pose = look_at((0, 0, 1.2), (0, 0, 0), up=(0, 1, 0))
+    s.camera_sensor("cam", W, H, _pinhole(W, H, f), instances=1,
+                    local_pose=pose)
+    amp, scale, eps = 0.02, 3.0, 0.02
+    row = sx.make_params("stone", colors=((0.7, 0.7, 0.7),), scale=scale,
+                         offset=(11, 23, 5), roughness=1.0, bump=amp, eps=eps)
+    out = []
+    for a in (amp, 0.0):
+        row[sx.PARAM["bump"]] = a
+        rm.set_materials(solid_texture=np.stack([row, row])[None])
+        out.append(renderer.render("cam", outputs=("linear", "depth"),
+                                   spp=64))
+    L, L0 = (o["linear"][0].mean(-1).cpu() for o in out)
+    z = out[0]["depth"][0].cpu()
+    v, u = torch.meshgrid(torch.arange(float(H)), torch.arange(float(W)),
+                          indexing="ij")
+    xc = torch.stack([(u - (W - 1) / 2) / f * z, (v - (H - 1) / 2) / f * z,
+                      z], -1)
+    cp = torch.as_tensor(pose, dtype=torch.float32)
+    pw = (cp[:3] + _qrot(cp[3:].expand(xc.shape[:-1] + (4,)), xc)).reshape(-1, 3)
+    qi = torch.as_tensor([-q[0], -q[1], -q[2], q[3]])
+    p = _qrot(qi.expand(len(pw), 4), pw - torch.as_tensor(shift))   # body-local
+    rows = torch.as_tensor(row).expand(len(p), sx.K)
+    e = eps / scale
+    h0, _ = sx.evaluate(p, rows)
+    gx = (sx.evaluate(p + torch.tensor([e, 0, 0]), rows)[0] - h0) / e
+    gy = (sx.evaluate(p + torch.tensor([0, e, 0]), rows)[0] - h0) / e
+    # body-local gradient -> world
+    g = _qrot(torch.as_tensor(q).expand(len(p), 4),
+              torch.stack([gx, gy, torch.zeros_like(gx)], -1))
+    sn = torch.as_tensor(sun / np.linalg.norm(sun), dtype=torch.float32)
+
+    def cos_ratio(sign):
+        n = torch.stack([-sign * amp * g[:, 0], -sign * amp * g[:, 1],
+                         torch.ones_like(gx)], -1)
+        n = n / n.norm(dim=-1, keepdim=True)
+        return (n @ sn).clamp(min=0) / sn[2]
+
+    ok = (z > 0).reshape(-1) & (L0.reshape(-1) > 0.05)
+    ratio = (L / L0.clamp(min=1e-4)).reshape(-1)[ok]
+    corr = lambda x: float(torch.corrcoef(torch.stack([ratio, x[ok]]))[0, 1])  # noqa: E731
+    assert float(ratio.std()) > 0.03                     # visibly bumped
+    assert corr(cos_ratio(1.0)) > 0.85
+    assert corr(cos_ratio(-1.0)) < 0.0

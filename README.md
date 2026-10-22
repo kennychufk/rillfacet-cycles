@@ -43,13 +43,27 @@ Per-env domain randomization is a write to the scene, never a rebuild:
 materials multiply their texture by the per-env color), `CameraSensor.set_lens`
 (aperture, focus distance, gain = exposure and white balance).
 
+Procedural solid (3D) textures (`Material(..., solid_texture=True, bump=...)`,
+`mesh.set_materials(solid_texture=rillfacet.solid_texture.sample_params(rng,
+(E, M)))`: wood, marble, granite, stone, checker, randomized per env) render
+as in rillfacet's Mitsuba and raster backends, through an OSL port of
+`rillfacet.solid_texture` (`python/rillfacet_cycles/solid_texture.osl`)
+checked against its torch reference. Cycles runs OSL on the CPU and on OptiX
+only (on CUDA these slots show their first color); the first OptiX render
+with OSL compiles Cycles' OSL kernels once (~90 s, then cached on disk). A
+scene with solid textures shades everything through OSL: ~1.25x the time of
+SVM (a cube on a floor, 16 envs, 320 x 180, 16 spp, RGB + depth +
+segmentation: 12.3 vs 9.7 ms per env); the patterns, and their bump, add
+little on top.
+
 ## How it works
 
 See the module docstring of `rillfacet_cycles`. In short:
 
 - One Blender mesh per body, one object per (env, body); envs on a grid
   `env_spacing` apart. Per-env appearance is in object custom properties
-  that shared materials read through Attribute nodes.
+  that shared materials read through Attribute nodes (solid texture
+  parameter rows too).
 - Cycles renders one camera per call, so a frame is one render per env.
   Persistent data keeps the scene on the GPU between renders.
 - OpenCV lenses (the 14-coefficient rational + thin-prism model included):
@@ -57,8 +71,9 @@ See the module docstring of `rillfacet_cycles`. In short:
   thin-lens depth of field and denoiser; torch resamples it through the exact
   distortion.
 - Depth and segmentation come from a second, one-sample render of the same
-  scene: an AOV every material writes, passed on by the compositor. Only film
-  settings change between the two renders, so Cycles' session stays warm.
+  scene: Cycles' Depth and Object Index passes, combined by the compositor.
+  Only film settings change between the two renders, so Cycles' session
+  stays warm.
 
 Measured on an RTX 5070 Ti (the quiddel-rl oven-grasp scene, UR5e visual
 meshes, 320 x 180 Pi Camera Module 3 Wide, 16 spp path tracing, RGB + depth +

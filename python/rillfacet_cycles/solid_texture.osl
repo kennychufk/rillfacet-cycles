@@ -1,0 +1,278 @@
+// Procedural SOLID (3D) textures for Cycles (OSL): a line-by-line port of
+// rillfacet's python/rillfacet/solid_texture.py (the spec and the torch
+// reference; its docstring has the parameter layout) by way of its WGSL
+// port (shaders/common/noise.wgsl, shaders/common/solid_texture.wgsl).
+// Keep them in sync: the tests compare this shader against the reference.
+//
+// Unfiltered (footprint 0), like Mitsuba: Cycles averages over its samples.
+// OSL has only signed 32-bit ints; they wrap like uint32 under + and *, and
+// lsr() is the logical shift right.
+
+#include "stdosl.h"
+
+#define TURB_MEAN 0.2198
+
+int lsr(int x, int k) { return (x >> k) & ((1 << (32 - k)) - 1); }
+
+float nz_lerp(float a, float b, float t) { return a + (b - a) * t; }
+color st_lerp3(color a, color b, float t) { return a + (b - a) * t; }
+
+float nz_smooth(float e0, float e1, float x)
+{
+  float t = clamp((x - e0) * (1.0 / (e1 - e0)), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+// PCG3D (Jarzynski & Olano 2020).
+void pcg3d(int ax, int ay, int az, output int x, output int y, output int z)
+{
+  x = ax * 1664525 + 1013904223;
+  y = ay * 1664525 + 1013904223;
+  z = az * 1664525 + 1013904223;
+  x += y * z;
+  y += z * x;
+  z += x * y;
+  x ^= lsr(x, 16);
+  y ^= lsr(y, 16);
+  z ^= lsr(z, 16);
+  x += y * z;
+  y += z * x;
+  z += x * y;
+}
+
+float nz_unit(int h) { return float(lsr(h, 8)) * (1.0 / 16777216.0); }
+
+float nz_grad(int hash, float x, float y, float z)
+{
+  int h = hash & 15;
+  float u = h < 8 ? x : y;
+  float v = h < 4 ? y : ((h == 12 || h == 14) ? x : z);
+  return ((h & 1) == 0 ? u : -u) + ((h & 2) == 0 ? v : -v);
+}
+
+// Gradient noise, about -1..1.
+float perlin(point p)
+{
+  point fl = floor(p);
+  vector f = p - fl;
+  int ix = int(fl[0]), iy = int(fl[1]), iz = int(fl[2]);
+  vector w = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  float vals[8];
+  for (int k = 0; k < 8; k++) {
+    int dx = k & 1, dy = (k >> 1) & 1, dz = k >> 2;
+    int h, hy, hz;
+    pcg3d(ix + dx, iy + dy, iz + dz, h, hy, hz);
+    vals[k] = nz_grad(h, f[0] - dx, f[1] - dy, f[2] - dz);
+  }
+  float x00 = nz_lerp(vals[0], vals[1], w[0]);
+  float x10 = nz_lerp(vals[2], vals[3], w[0]);
+  float x01 = nz_lerp(vals[4], vals[5], w[0]);
+  float x11 = nz_lerp(vals[6], vals[7], w[0]);
+  return nz_lerp(nz_lerp(x00, x10, w[1]), nz_lerp(x01, x11, w[1]), w[2]);
+}
+
+// Normalized fractal sum (gain 0.5, lacunarity 2): about -1..1
+// (turbulence: 0..1).
+float fbm(point p, int octaves, int turbulence)
+{
+  float tot = 0.0, amp = 1.0, norm = 0.0, s = 1.0;
+  for (int o = 0; o < octaves; o++) {
+    float n = perlin(p * s);
+    if (turbulence) n = abs(n);
+    tot += n * amp;
+    norm += amp;
+    amp *= 0.5;
+    s *= 2.0;
+  }
+  return tot * (1.0 / norm);
+}
+
+// F1, F2 and the hash of the nearest cell.
+void worley(point p, output float F1, output float F2, output int cid)
+{
+  point fl = floor(p);
+  vector f = p - fl;
+  int ix = int(fl[0]), iy = int(fl[1]), iz = int(fl[2]);
+  F1 = 8.0;
+  F2 = 8.0;
+  cid = 0;
+  for (int dz = -1; dz <= 1; dz++) {
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        int hx, hy, hz;
+        pcg3d(ix + dx, iy + dy, iz + dz, hx, hy, hz);
+        float ddx = dx + nz_unit(hx) - f[0];
+        float ddy = dy + nz_unit(hy) - f[1];
+        float ddz = dz + nz_unit(hz) - f[2];
+        float r = ddx * ddx + ddy * ddy + ddz * ddz;
+        int closer = r < F1;
+        F2 = closer ? F1 : min(F2, r);
+        cid = closer ? hz : cid;
+        F1 = closer ? r : F1;
+      }
+    }
+  }
+  F1 = sqrt(F1);
+  F2 = sqrt(F2);
+}
+
+// ---- the families: (h, linear rgb) at pattern point q -----------------------
+
+#define ST_FAMILY 0
+#define ST_SCALE 1
+#define ST_OFFSET 2
+#define ST_R 5
+#define ST_C0 14
+#define ST_C1 17
+#define ST_C2 20
+#define ST_A 23
+#define ST_ROUGH0 27
+#define ST_ROUGH1 28
+#define ST_BUMP 29
+#define ST_EPS 30
+
+color sp3(float S[32], int k) { return color(S[k], S[k + 1], S[k + 2]); }
+
+// q = R @ (scale * p), p body-local.
+point st_pattern_point(float S[32], point p)
+{
+  point ps = p * S[ST_SCALE];
+  point q;
+  for (int i = 0; i < 3; i++)
+    q[i] = S[ST_R + 3 * i] * ps[0] + S[ST_R + 3 * i + 1] * ps[1]
+         + S[ST_R + 3 * i + 2] * ps[2];
+  return q;
+}
+
+// Noise lookup point (the offset shifts noise only).
+point st_off(float S[32], point q, float k)
+{
+  return q * k + point(S[ST_OFFSET], S[ST_OFFSET + 1], S[ST_OFFSET + 2]);
+}
+
+void st_wood(float S[32], point q, output float h, output color c)
+{
+  float a0 = S[ST_A], a1 = S[ST_A + 1], a2 = S[ST_A + 2], a3 = S[ST_A + 3];
+  float x = q[0] + a2;
+  float rr = sqrt(x * x + q[1] * q[1]);
+  point qo = st_off(S, q, 1.0);
+  float warp = fbm(point(qo[0] * 0.8, qo[1] * 0.8, qo[2] * 0.12), 3, 0);
+  float tt = (rr + a1 * warp) * a0;
+  float t = tt - floor(tt);
+  float ring = nz_smooth(0.0, 0.85, t) * (1.0 - nz_smooth(0.85, 1.0, t));
+  ring = ring * ring;
+  float fib = fbm(point(qo[0] * 14.0, qo[1] * 14.0, qo[2] * 0.7), 2, 0);
+  h = clamp(ring * (1.0 - a3) + (fib * 0.5 + 0.5) * a3, 0.0, 1.0);
+  c = st_lerp3(sp3(S, ST_C0), sp3(S, ST_C1), h);
+}
+
+void st_marble(float S[32], point q, output float h, output color c)
+{
+  float a0 = S[ST_A], a1 = S[ST_A + 1], a2 = S[ST_A + 2];
+  point qo = st_off(S, q, 1.0);
+  float turb = fbm(qo, 4, 1);
+  float s = 0.5 + 0.5 * sin(q[0] * a0 + a1 * turb * 6.0);
+  float v = clamp(1.0 - s, 0.0, 1.0);
+  float v2 = v * v;
+  float vein = v2 * v2 * v2 * a2 + v2 * (1.0 - a2);
+  float tint = fbm(point(qo[0] * 0.5 + 7.0, qo[1] * 0.5, qo[2] * 0.5), 2, 0)
+               * 0.5 + 0.5;
+  color base = st_lerp3(sp3(S, ST_C0), sp3(S, ST_C2), tint * 0.35);
+  h = vein;
+  c = st_lerp3(base, sp3(S, ST_C1), vein);
+}
+
+void st_granite(float S[32], point q, output float h, output color c)
+{
+  float a0 = S[ST_A], a1 = S[ST_A + 1], a2 = S[ST_A + 2];
+  float F1, F2;
+  int cid;
+  worley(st_off(S, q, a0), F1, F2, cid);
+  float u = nz_unit(cid);
+  color col = u < a1 ? sp3(S, ST_C1) : sp3(S, ST_C0);
+  col = u > 1.0 - a2 ? sp3(S, ST_C2) : col;
+  float edge = nz_smooth(0.0, 0.12, F2 - F1);         // dark grain boundaries
+  h = 1.0 - edge;
+  c = col * (0.75 + 0.25 * edge);
+}
+
+void st_stone(float S[32], point q0, output float h, output color c)
+{
+  float a0 = S[ST_A], a1 = S[ST_A + 1];
+  point q = st_off(S, q0, 1.0);
+  vector w = vector(fbm(point(q[0] + 1.7, q[1] + 9.2, q[2]), 3, 0),
+                    fbm(point(q[0] + 8.3, q[1] + 2.8, q[2] + 4.1), 3, 0),
+                    fbm(point(q[0] + 4.4, q[1] + 6.6, q[2] + 1.3), 3, 0));
+  float n = fbm(q + a0 * w, 4, 0);
+  h = clamp(0.5 + a1 * n, 0.0, 1.0);
+  color col = st_lerp3(sp3(S, ST_C0), sp3(S, ST_C1), h);
+  float spot = nz_smooth(0.55, 0.75, fbm(q * 3.0, 2, 0) * 0.5 + 0.5);
+  c = st_lerp3(col, sp3(S, ST_C2), spot * 0.6);
+}
+
+void st_checker(float S[32], point q, output float h, output color c)
+{
+  float s = floor(q[0]) + floor(q[1]) + floor(q[2]);
+  int odd = (s - 2.0 * floor(s * 0.5)) > 0.5;
+  h = odd ? 1.0 : 0.0;
+  c = odd ? sp3(S, ST_C1) : sp3(S, ST_C0);
+}
+
+// (h, linear rgb) of the row's family at body-local p.
+void solid_texture(float S[32], point p, output float h, output color c)
+{
+  point q = st_pattern_point(S, p);
+  int f = min(int(S[ST_FAMILY]), 5);
+  if (f == 1) st_wood(S, q, h, c);
+  else if (f == 2) st_marble(S, q, h, c);
+  else if (f == 3) st_granite(S, q, h, c);
+  else if (f == 4) st_stone(S, q, h, c);
+  else if (f == 5) st_checker(S, q, h, c);
+  else { h = 0.0; c = sp3(S, ST_C0); }
+}
+
+// The material's base color, roughness and (Bump) shading normal from the
+// row in p0..p7 / w0..w7 (parameters 4k..4k+2 / 4k+3: the object
+// attributes rf_s<slot>_<k>; colors linear) at the body-local point Pl
+// (the Object texture coordinate). The bump: finite differences of h along
+// two tangents of N (as rillfacet's backends: N - grad h * bump), taken
+// body-local.
+shader rf_solid_texture(
+    point Pl = point(0),
+    vector p0 = 0, vector p1 = 0, vector p2 = 0, vector p3 = 0,
+    vector p4 = 0, vector p5 = 0, vector p6 = 0, vector p7 = 0,
+    float w0 = 0, float w1 = 0, float w2 = 0, float w3 = 0,
+    float w4 = 0, float w5 = 0, float w6 = 0, float w7 = 0,
+    int Bump = 0,
+    output color Color = 0,
+    output float Roughness = 0,
+    output float Height = 0,
+    output normal Normal = 0)
+{
+  vector pv[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
+  float wv[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
+  float S[32];
+  for (int k = 0; k < 8; k++) {
+    S[4 * k] = pv[k][0];
+    S[4 * k + 1] = pv[k][1];
+    S[4 * k + 2] = pv[k][2];
+    S[4 * k + 3] = wv[k];
+  }
+  float h0;
+  solid_texture(S, Pl, h0, Color);
+  Height = h0;
+  Roughness = nz_lerp(S[ST_ROUGH0], S[ST_ROUGH1], h0);
+  Normal = N;
+  if (Bump) {
+    vector a = abs(N[0]) > 0.9 ? vector(0, 1, 0) : vector(1, 0, 0);
+    vector t1 = normalize(cross(N, a));
+    vector t2 = cross(N, t1);
+    float eps = S[ST_EPS] / S[ST_SCALE];
+    float h1, h2;
+    color c;
+    solid_texture(S, Pl + eps * transform("world", "object", t1), h1, c);
+    solid_texture(S, Pl + eps * transform("world", "object", t2), h2, c);
+    vector g = (t1 * (h1 - h0) + t2 * (h2 - h0)) * (S[ST_BUMP] / eps);
+    Normal = normalize(N - g);
+  }
+}

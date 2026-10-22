@@ -19,3 +19,6 @@ test = ["pytest"]
 
 [tool.setuptools.packages.find]
 where = ["python"]
+
+[tool.setuptools.package-data]
+rillfacet_cycles = ["*.osl"]

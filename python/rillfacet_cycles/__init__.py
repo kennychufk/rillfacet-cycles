@@ -20,6 +20,13 @@ How it maps the scene onto Blender, and why:
   roughness, metallic per material slot) that one shared material per slot
   reads, so randomizing appearance never rebuilds a shader. A textured
   slot multiplies its texture by the per-env color.
+- Solid-texture slots (:mod:`rillfacet.solid_texture`) run an OSL port of
+  its families (``solid_texture.osl``) at the Object texture coordinate,
+  which is body-local; each object's parameter rows are 8 more custom
+  properties per slot (``rf_s<slot>_<k>``, 4 floats each, colors linear).
+  OSL is on only in scenes that have such slots; Cycles runs it on the CPU
+  and on OptiX, not on CUDA, where those slots show their rows' first
+  color ``c0`` and roughness ``rough0``.
 - Cycles renders one camera per call, so a frame is one render per env.
   ``use_persistent_data`` keeps the scene on the GPU between renders: a
   render after moving objects or the camera re-syncs only what changed.
@@ -31,8 +38,10 @@ How it maps the scene onto Blender, and why:
   ``supersample`` points per output pixel. Wide lenses cost more proxy
   pixels (the 120-degree Pi Camera Module 3 Wide: ~1.8x the output's).
 - Depth and segmentation come from a second render of the same scene: one
-  sample per pixel at the pixel center, the compositor passing on the
-  ``rf_geo`` AOV (camera z-depth, label, 1) every material writes. Only
+  sample per pixel at the pixel center, the compositor combining Cycles'
+  Depth (camera z-depth) and Object Index (label + 1: each object's
+  ``pass_index``) passes into one image. (An AOV that the materials write
+  would not work with OSL, which does not implement AOV outputs.) Only
   film settings change between the two, so the session stays warm (~8 ms
   beauty + ~3.5 ms geometry per env at 432 x 244 on an RTX 5070 Ti, the
   oven-grasp scene). Each output pixel's center ray
@@ -48,6 +57,7 @@ Not modelled yet: motion blur.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import itertools
 import os
 import shutil
@@ -59,6 +69,7 @@ import numpy as np
 from rillfacet.render import Renderer, linear_to_srgb, srgb_to_linear
 from rillfacet.render.camera import PixelRays
 from rillfacet.scene_api import Light
+from rillfacet.solid_texture import PARAM, linearize
 
 __all__ = ["CyclesRenderer"]
 __version__ = "0.1.0"
@@ -69,6 +80,24 @@ _DEFAULT_LIGHTS = (
          direction=(0.3, 0.2, -1.0)),
 )
 _ids = itertools.count()
+
+_OSL_SOURCE = os.path.join(os.path.dirname(__file__), "solid_texture.osl")
+_osl_bytecode = None
+
+
+def _solid_texture_bytecode(tmp):
+    """The compiled ``solid_texture.osl`` (OSL bytecode, compiled once per
+    process)."""
+    global _osl_bytecode
+    if _osl_bytecode is None:
+        import _cycles
+        oso = os.path.join(tmp, "solid_texture.oso")
+        if not _cycles.osl_compile(_OSL_SOURCE, oso):
+            raise RuntimeError(f"cannot compile {_OSL_SOURCE}")
+        with open(oso) as f:
+            _osl_bytecode = f.read()
+    return _osl_bytecode
+
 
 #: Largest tangent of the angle off the optical axis a pinhole proxy covers
 #: (about 79 degrees).
@@ -214,6 +243,7 @@ class CyclesRenderer(Renderer):
         self._hidden: dict = {}
         self.last_timing: dict = {}
         self._aperture = 0.0
+        self._osl = False                      # OSL shading (solid textures)
         self._make_scenes()
 
     # -- setup ----------------------------------------------------------------
@@ -240,8 +270,8 @@ class CyclesRenderer(Renderer):
     def _make_scenes(self):
         """One scene for both passes. The beauty pass renders ``spp``
         samples; the geometry pass one sample at the pixel center, the
-        compositor writing the ``rf_geo`` AOV (camera z-depth, label, 1)
-        that every material emits alongside its BSDF. Switching passes
+        compositor writing (Depth, Object Index, 0): camera z-depth and
+        label + 1 (0 = nothing). Switching passes
         touches only film / sampling settings and the compositor flag, so
         Cycles' persistent session stays warm (a material override or an
         emissive switch rebuilds the light distribution, ~70 ms)."""
@@ -280,16 +310,20 @@ class CyclesRenderer(Renderer):
         self._world = bpy.data.worlds.new(self._prefix + "world")
         _use_nodes(self._world)
         sc.world = self._world
-        aov = sc.view_layers[0].aovs.add()
-        aov.name, aov.type = "rf_geo", "COLOR"
+        vl = sc.view_layers[0]
+        vl.use_pass_z = vl.use_pass_object_index = True
         ng = bpy.data.node_groups.new(self._prefix + "comp",
                                       "CompositorNodeTree")
         ng.interface.new_socket("Image", in_out="OUTPUT",
                                 socket_type="NodeSocketColor")
         rl = ng.nodes.new("CompositorNodeRLayers")
         rl.scene = sc
+        comb = ng.nodes.new("CompositorNodeCombineColor")
         go = ng.nodes.new("NodeGroupOutput")
-        ng.links.new(rl.outputs["rf_geo"], go.inputs[0])
+        index = rl.outputs.get("Object Index") or rl.outputs["IndexOB"]  # < 5.0
+        ng.links.new(rl.outputs["Depth"], comb.inputs["Red"])
+        ng.links.new(index, comb.inputs["Green"])
+        ng.links.new(comb.outputs[0], go.inputs[0])
         sc.compositing_node_group = ng
         self._mode = None
         self._static = [sc, self._coll, self._light_coll, self._world, ng,
@@ -367,7 +401,20 @@ class CyclesRenderer(Renderer):
 
     def _build(self):
         self._clear()
+        solid = any(mat.solid_texture for m in self.meshes.values()
+                    for mat in m.materials)
+        self._osl = solid and (self._device == "CPU"
+                               or self._kind == "OPTIX")
+        if solid and not self._osl:
+            warnings.warn("CyclesRenderer: solid textures need OSL, which "
+                          f"Cycles runs on the CPU and OptiX, not {self._kind}"
+                          ": they show their first color c0")
+        if self._sc.cycles.shading_system != self._osl:
+            self._sc.cycles.shading_system = self._osl
         bases = self.label_bases()
+        if sum(m.num_bodies for m in self.meshes.values()) >= 1 << 15:
+            raise ValueError("CyclesRenderer: at most 32767 bodies (labels "
+                             "are Blender's object pass indices)")
         for mi, m in enumerate(self.meshes.values()):
             self._build_mesh(mi, m, bases[m.name])
         self._structure_dirty = False
@@ -376,7 +423,8 @@ class CyclesRenderer(Renderer):
 
     def _material(self, name, mat, slot, textured):
         """A shared Principled BSDF reading the per-object attributes of
-        ``slot`` (and multiplying ``mat``'s texture by its color)."""
+        ``slot`` (and multiplying ``mat``'s texture by its color, or taking
+        color, roughness and maybe the normal from its solid texture)."""
         bpy = self.bpy
         bm = bpy.data.materials.new(name)
         self._blocks.append(bm)
@@ -386,24 +434,20 @@ class CyclesRenderer(Renderer):
         bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
         out = nt.nodes.new("ShaderNodeOutputMaterial")
         nt.links.new(bsdf.outputs[0], out.inputs["Surface"])
-        # the geometry pass's AOV: (camera z-depth, label, 1)
-        cd = nt.nodes.new("ShaderNodeCameraData")
-        lab = nt.nodes.new("ShaderNodeAttribute")
-        lab.attribute_type = "OBJECT"
-        lab.attribute_name = "rf_label"
-        xyz = nt.nodes.new("ShaderNodeCombineXYZ")
-        xyz.inputs[2].default_value = 1.0
-        geo = nt.nodes.new("ShaderNodeOutputAOV")
-        geo.aov_name = "rf_geo"
-        nt.links.new(cd.outputs["View Z Depth"], xyz.inputs[0])
-        nt.links.new(lab.outputs["Fac"], xyz.inputs[1])
-        nt.links.new(xyz.outputs[0], geo.inputs["Color"])
 
         def attr(prefix):
             a = nt.nodes.new("ShaderNodeAttribute")
             a.attribute_type = "OBJECT"
             a.attribute_name = f"{prefix}{slot}"
             return a
+        nt.links.new(attr("rf_m").outputs["Fac"], bsdf.inputs["Metallic"])
+        if mat is not None and mat.solid_texture and self._osl:
+            st = self._solid_texture_node(nt, slot, mat.bump)
+            nt.links.new(st.outputs["Color"], bsdf.inputs["Base Color"])
+            nt.links.new(st.outputs["Roughness"], bsdf.inputs["Roughness"])
+            if mat.bump:
+                nt.links.new(st.outputs["Normal"], bsdf.inputs["Normal"])
+            return bm
         color = attr("rf_c").outputs["Color"]
         if textured:
             img = self._texture_image(name, mat.base_color_texture)
@@ -417,8 +461,40 @@ class CyclesRenderer(Renderer):
             color = mul.outputs["Vector"]
         nt.links.new(color, bsdf.inputs["Base Color"])
         nt.links.new(attr("rf_r").outputs["Fac"], bsdf.inputs["Roughness"])
-        nt.links.new(attr("rf_m").outputs["Fac"], bsdf.inputs["Metallic"])
         return bm
+
+    def _solid_texture_node(self, nt, slot, bump):
+        """``solid_texture.osl`` in ``nt``, at the Object (body-local)
+        coordinate, reading ``slot``'s parameter rows from the object
+        attributes ``rf_s<slot>_<k>`` (Vector: parameters 4k..4k+2, Alpha:
+        4k+3)."""
+        code = _solid_texture_bytecode(self._tmp)
+        st = nt.nodes.new("ShaderNodeScript")
+        st.mode = "INTERNAL"
+        st.bytecode = code
+        st.bytecode_hash = hashlib.md5(code.encode(),
+                                       usedforsecurity=False).hexdigest()
+        # the shader's parameters (oslquery, which the Cycles add-on reads
+        # them with, is not importable from the bpy module)
+        new_in = lambda kind, n: st.inputs.new(            # noqa: E731
+            type=f"NodeSocket{kind}", name=n, identifier=n)
+        for n in ["Pl"] + [f"p{k}" for k in range(8)]:
+            new_in("Vector", n)
+        for k in range(8):
+            new_in("Float", f"w{k}")
+        new_in("Int", "Bump").default_value = int(bump)
+        for kind, n in (("Color", "Color"), ("Float", "Roughness"),
+                        ("Float", "Height"), ("Vector", "Normal")):
+            st.outputs.new(type=f"NodeSocket{kind}", name=n, identifier=n)
+        tc = nt.nodes.new("ShaderNodeTexCoord")
+        nt.links.new(tc.outputs["Object"], st.inputs["Pl"])
+        for k in range(8):
+            a = nt.nodes.new("ShaderNodeAttribute")
+            a.attribute_type = "OBJECT"
+            a.attribute_name = f"rf_s{slot}_{k}"
+            nt.links.new(a.outputs["Vector"], st.inputs[f"p{k}"])
+            nt.links.new(a.outputs["Alpha"], st.inputs[f"w{k}"])
+        return st
 
     def _texture_image(self, name, tex):
         bpy = self.bpy
@@ -495,7 +571,7 @@ class CyclesRenderer(Renderer):
             for i in range(I):
                 ob = bpy.data.objects.new(f"{tag}i{i}_b{b}", me)
                 ob.rotation_mode = "QUATERNION"
-                ob["rf_label"] = float(label_base + b)
+                ob.pass_index = label_base + b + 1     # the geometry pass
                 self._coll.objects.link(ob)
                 objs.append((i, b, ob))
         self._objects[m.name] = objs
@@ -587,11 +663,23 @@ class CyclesRenderer(Renderer):
     def _write_appearance(self, m):
         I, B = m.instances, m.num_bodies
         slots = self._slots[m.name]
+        solid = set()
         if m.materials:
             color = srgb_to_linear(np.asarray(m.material_base_color,
                                               np.float32))
             rough = np.asarray(m.material_roughness, np.float32)
             metal = np.asarray(m.material_metallic, np.float32)
+            solid = {s for s, mat in enumerate(m.materials)
+                     if mat.solid_texture}
+            if solid:
+                rows = linearize(m.material_solid_texture)
+                if not self._osl:            # c0, rough0 instead
+                    mask = np.array([mat.solid_texture for mat in m.materials])
+                    k = PARAM["c0"]
+                    color = np.where(mask[:, None], rows[..., k:k + 3], color)
+                    rough = np.where(mask, rows[..., PARAM["rough0"]], rough)
+                    solid = set()
+                rows = rows.reshape(I, len(m.materials), 8, 4)
         else:
             seg = srgb_to_linear(np.asarray(m.segment_colors, np.float32))
         for i, b, ob in self._objects[m.name]:
@@ -600,10 +688,16 @@ class CyclesRenderer(Renderer):
                     ob[f"rf_c{s}"] = color[i, s].tolist()
                     ob[f"rf_r{s}"] = float(rough[i, s])
                     ob[f"rf_m{s}"] = float(metal[i, s])
+                    if s in solid:
+                        for k in range(8):
+                            ob[f"rf_s{s}_{k}"] = rows[i, s, k].tolist()
                 else:
                     ob[f"rf_c{s}"] = seg[i * B + b].tolist()
                     ob[f"rf_r{s}"] = 0.5
                     ob[f"rf_m{s}"] = 0.0
+            # ID properties written from Python tag nothing: without this,
+            # Cycles' persistent data keeps the attributes it synced first
+            ob.update_tag(refresh={"OBJECT"})
 
     def _write_poses(self, m):
         I, B = m.instances, m.num_bodies
@@ -706,7 +800,7 @@ class CyclesRenderer(Renderer):
         torch = self.torch
         g = torch.as_tensor(geom[..., :3], device=self.dev).reshape(I, -1, 3)
         nb = g[:, proxy.nb_idx]                                 # [I, P, 4, 3]
-        z, lab, hit = nb[..., 0], nb[..., 1], nb[..., 2] > 0.5
+        z, lab, hit = nb[..., 0], nb[..., 1] - 1, nb[..., 1] > 0.5
         near = proxy.nearest.expand(I, -1, -1)[..., None]        # [I, P, 1, 1]
         zn = torch.gather(z, 2, near[..., 0])[..., 0]
         ln = torch.gather(lab, 2, near[..., 0])[..., 0]
