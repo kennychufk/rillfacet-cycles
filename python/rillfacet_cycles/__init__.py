@@ -825,6 +825,10 @@ class CyclesRenderer(Renderer):
                 raise ValueError(f"camera {camera!r} has {cam.instances} "
                                  f"instances, rigid mesh {m.name!r} "
                                  f"{m.instances}")
+        if getattr(cam, "per_instance_intrinsics", False):
+            raise NotImplementedError(
+                f"camera {camera!r}: CyclesRenderer does not support "
+                "per-instance intrinsics (use the raster or Mitsuba renderer)")
         t0 = time.perf_counter()
         self._sync()
         t_sync = time.perf_counter() - t0
