@@ -73,6 +73,8 @@ def _fresh(r):
     """Detach ``r`` from its previous scene's objects."""
     for name in list(r.meshes) + list(r.lights) + list(r.cameras):
         r.remove(name)
+    if r.background is not None:
+        r.remove(r.background.name)
     r._structure_dirty = True
 
 
@@ -221,6 +223,68 @@ def test_matches_mitsuba():
     assert (sc == sm).mean() > 0.97
     both = (sc == sm) & (sc >= 0)
     assert np.median(np.abs(dc - dm)[both]) < 2e-3
+
+
+def test_background_panoramas(renderer):
+    """Each env sees its own panorama where nothing is hit (the torch lookup
+    along the output pixels' center rays), index -1 the world color, and
+    the panoramas light nothing."""
+    from rillfacet.render.camera import PixelRays
+    from rillfacet_cycles import _quat_mat
+    _fresh(renderer)
+    I, W, H = 3, 48, 32
+    K = _pinhole(W, H, 40.0)
+    sc = Scene(renderer)
+    v, f = _box()
+    m = sc.rigid_mesh("m", (v * 0.5 + [0, 0, 2.0]).astype(np.float32),
+                      np.zeros(len(v), np.int64), f, [0, len(f)], instances=I)
+    p = np.zeros((I, 1, 7), np.float32)
+    p[..., 6] = 1
+    m.set_poses(p)
+    sc.light("sky", "ambient", intensity=0.25)
+    poses = np.stack([look_at((0, 0, 0), (0, 0, 1), up=(0, -1, 0)),
+                      look_at((0, 0, 0), (0.6, 0.3, 1), up=(0, 0, 1)),
+                      look_at((0, 0, 0), (0, 0, 1), up=(0, -1, 0))])
+    sc.camera_sensor("c", W, H, K, instances=I, local_pose=poses, far=10)
+    u = (np.arange(64) + 0.5) / 64
+    img = np.zeros((2, 32, 64, 3), np.float32)
+    img[..., 0] = 0.2 + 0.6 * (0.5 + 0.5 * np.cos(2 * np.pi * u))
+    img[..., 1] = np.linspace(0.1, 0.9, 32)[:, None]
+    img[1, ..., 2] = 0.6
+    bg = sc.background("bg", img, instances=I, index=[0, 1, -1],
+                       yaw=[0.4, -1.0, 0.0], intensity=[1.0, 2.0, 1.0])
+    out = renderer.render("c", outputs=("linear", "segmentation"), spp=32)
+    lin = out["linear"].cpu().numpy()
+    seg = out["segmentation"].cpu().numpy()
+    rays = PixelRays(K, W, H, None, device="cpu")
+    d = torch.cat([rays.center, torch.ones(W * H, 1)], 1)
+    d = d / d.norm(dim=1, keepdim=True)
+    fp = torch.maximum(rays.d_du.norm(dim=-1), rays.d_dv.norm(dim=-1))
+    for i in range(I):
+        miss = seg[i] < 0
+        miss[1:-1] &= miss[:-2] & miss[2:]
+        miss[:, 1:-1] &= miss[:, :-2] & miss[:, 2:]
+        assert miss.mean() > 0.3
+        if i == 2:
+            np.testing.assert_allclose(lin[i][miss], 0.25, rtol=0.02)
+            continue
+        Rm = torch.as_tensor(_quat_mat(poses[i, 3:]), dtype=torch.float32)
+        ref, has = renderer.background_radiance(
+            None, torch.full((W * H,), i), d @ Rm.T, fp, "cpu")
+        assert bool(has.all())
+        np.testing.assert_allclose(lin[i][miss], ref.reshape(H, W, 3).numpy()[miss],
+                                   rtol=0.02, atol=5e-3)  # pixel filter
+    # the box is lit by the world alone (its inside, beyond the pixel filter)
+    inside = seg[0] == 0
+    for _ in range(2):
+        inside[1:-1] &= inside[:-2] & inside[2:]
+        inside[:, 1:-1] &= inside[:, :-2] & inside[:, 2:]
+    assert inside.sum() > 20
+    bg.set(index=-1)
+    plain = renderer.render("c", outputs=("linear",), spp=32)["linear"].cpu().numpy()
+    np.testing.assert_allclose(lin[0][inside].mean(0), plain[0][inside].mean(0),
+                               rtol=0.05)
+    _fresh(renderer)
 
 
 # -- solid (3D) textures --------------------------------------------------------

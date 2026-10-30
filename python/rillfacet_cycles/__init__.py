@@ -51,6 +51,12 @@ How it maps the scene onto Blender, and why:
   bpy exposes no render pixels in background mode.
 - Lights are shared by all envs (directional = sun, ambient = world color,
   envmap = world environment texture, Blender's equirectangular mapping).
+- A :class:`~rillfacet.scene_api.Background` (per-env panoramas, seen
+  only) is composited in torch: an env with a panorama renders its beauty
+  pass with a transparent film (the world still lights the scene, camera
+  rays that miss come back with alpha 0), and after the resample each
+  output pixel adds ``(1 - alpha)`` times the panorama along its center
+  ray (:class:`~rillfacet.render.BackgroundLookup`).
 
 Not modelled yet: motion blur.
 """
@@ -170,6 +176,12 @@ class _Proxy:
         xy = (rays.center[:, None] + a * rays.d_du[:, None]
               + b * rays.d_dv[:, None])                           # [P, S2, 2]
         self.grid_rgb = self._grid(xy).reshape(1, H * W, S * S, 2)
+        # center ray directions (OpenCV camera frame) and pixel sizes, for
+        # the background
+        d = torch.cat([rays.center, torch.ones_like(rays.center[:, :1])], 1)
+        self.dirs = d / d.norm(dim=1, keepdim=True)              # [P, 3]
+        self.footprint = torch.maximum(rays.d_du.norm(dim=-1),
+                                       rays.d_dv.norm(dim=-1))  # [P]
         # The center rays' 4 proxy neighbors (flat indices, bilinear
         # weights) and the nearest of them, for the geometry pass.
         u = self.f * rays.center[:, 0] + self.cx
@@ -766,6 +778,27 @@ class CyclesRenderer(Renderer):
         if (r.resolution_x, r.resolution_y) != (proxy.width, proxy.height):
             r.resolution_x, r.resolution_y = proxy.width, proxy.height
 
+    def _set_transparent(self, on):
+        """Transparent film for the beauty pass of an env with a panorama."""
+        r = self._sc.render
+        if r.film_transparent != on:
+            r.film_transparent = on
+
+    def _composite_background(self, lin, alpha, proxy, R, I):
+        """``lin`` ``[I, H, W, 3]`` plus ``(1 - alpha)`` times each env's
+        panorama along the output pixels' center rays."""
+        torch = self.torch
+        P = proxy.dirs.shape[0]
+        Rt = torch.as_tensor(R, device=self.dev, dtype=torch.float32)
+        d = torch.einsum("iab,pb->ipa", Rt, proxy.dirs).reshape(-1, 3)
+        env = torch.arange(I, device=self.dev)[:, None].expand(I, P).reshape(-1)
+        fp = proxy.footprint[None].expand(I, P).reshape(-1)
+        bg, has = self.background_radiance(None, env, d, fp, self.dev)
+        if not bool(has.any()):
+            return lin
+        bg = torch.where(has[:, None], bg, torch.zeros_like(bg))
+        return lin + (1 - alpha)[..., None] * bg.reshape(lin.shape)
+
     def _render_pass(self, geom, spp):
         """Render the beauty or the geometry pass of the placed camera;
         ``[h, w, 4]`` float32, row 0 = top."""
@@ -846,10 +879,17 @@ class CyclesRenderer(Renderer):
         geom = np.empty((I, proxy.height, proxy.width, 4), np.float32) \
             if want_geom else None
         spp = int(spp or self.spp)
+        bg = self.background
+        if bg is not None and bg.instances != I:
+            raise ValueError(f"camera {camera!r} has {I} instances, "
+                             f"background {bg.name!r} {bg.instances}")
+        pano = (np.zeros(I, bool) if bg is None
+                else np.asarray(bg.index) >= 0)
         t0 = time.perf_counter()
         for i in range(I):
             self._place_camera(cam, proxy, R, t, i)
             if want_rgb:
+                self._set_transparent(bool(pano[i]))
                 shade[i] = self._render_pass(False, spp)
             if want_geom:
                 geom[i] = self._render_pass(True, spp)
@@ -857,12 +897,17 @@ class CyclesRenderer(Renderer):
         t0 = time.perf_counter()
         out = {}
         if want_rgb:
-            img = torch.as_tensor(shade[..., :3], device=self.dev)
-            img = img.permute(0, 3, 1, 2)                       # [I, 3, h, w]
+            nc = 4 if pano.any() else 3
+            img = torch.as_tensor(shade[..., :nc], device=self.dev)
+            img = img.permute(0, 3, 1, 2)                      # [I, nc, h, w]
             g = proxy.grid_rgb.expand(I, -1, -1, -1)
             lin = F.grid_sample(img, g, mode="bilinear", padding_mode="border",
-                                align_corners=False).mean(-1)   # [I, 3, HW]
-            lin = lin.reshape(I, 3, H, W).permute(0, 2, 3, 1).clamp(min=0)
+                                align_corners=False).mean(-1)  # [I, nc, HW]
+            lin = lin.reshape(I, nc, H, W).permute(0, 2, 3, 1)
+            if nc == 4:            # premultiplied: add the panoramas behind
+                lin = self._composite_background(lin[..., :3], lin[..., 3],
+                                                 proxy, R, I)
+            lin = lin.clamp(min=0)
             lin = self.sensor_image(cam, lin)
             if "linear" in outputs:
                 out["linear"] = lin
