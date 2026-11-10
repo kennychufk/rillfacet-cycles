@@ -3,12 +3,11 @@
 // reference; its docstring has the parameter layout) by way of its WGSL
 // port (shaders/common/noise.wgsl, shaders/common/solid_texture.wgsl).
 // Keep them in sync: the tests compare this shader against the reference.
+// Included by texture.osl (the shader).
 //
 // Unfiltered (footprint 0), like Mitsuba: Cycles averages over its samples.
 // OSL has only signed 32-bit ints; they wrap like uint32 under + and *, and
 // lsr() is the logical shift right.
-
-#include "stdosl.h"
 
 #define TURB_MEAN 0.2198
 
@@ -229,50 +228,4 @@ void solid_texture(float S[32], point p, output float h, output color c)
   else if (f == 4) st_stone(S, q, h, c);
   else if (f == 5) st_checker(S, q, h, c);
   else { h = 0.0; c = sp3(S, ST_C0); }
-}
-
-// The material's base color, roughness and (Bump) shading normal from the
-// row in p0..p7 / w0..w7 (parameters 4k..4k+2 / 4k+3: the object
-// attributes rf_s<slot>_<k>; colors linear) at the body-local point Pl
-// (the Object texture coordinate). The bump: finite differences of h along
-// two tangents of N (as rillfacet's backends: N - grad h * bump), taken
-// body-local.
-shader rf_solid_texture(
-    point Pl = point(0),
-    vector p0 = 0, vector p1 = 0, vector p2 = 0, vector p3 = 0,
-    vector p4 = 0, vector p5 = 0, vector p6 = 0, vector p7 = 0,
-    float w0 = 0, float w1 = 0, float w2 = 0, float w3 = 0,
-    float w4 = 0, float w5 = 0, float w6 = 0, float w7 = 0,
-    int Bump = 0,
-    output color Color = 0,
-    output float Roughness = 0,
-    output float Height = 0,
-    output normal Normal = 0)
-{
-  vector pv[8] = {p0, p1, p2, p3, p4, p5, p6, p7};
-  float wv[8] = {w0, w1, w2, w3, w4, w5, w6, w7};
-  float S[32];
-  for (int k = 0; k < 8; k++) {
-    S[4 * k] = pv[k][0];
-    S[4 * k + 1] = pv[k][1];
-    S[4 * k + 2] = pv[k][2];
-    S[4 * k + 3] = wv[k];
-  }
-  float h0;
-  solid_texture(S, Pl, h0, Color);
-  Height = h0;
-  Roughness = nz_lerp(S[ST_ROUGH0], S[ST_ROUGH1], h0);
-  Normal = N;
-  if (Bump) {
-    vector a = abs(N[0]) > 0.9 ? vector(0, 1, 0) : vector(1, 0, 0);
-    vector t1 = normalize(cross(N, a));
-    vector t2 = cross(N, t1);
-    float eps = S[ST_EPS] / S[ST_SCALE];
-    float h1, h2;
-    color c;
-    solid_texture(S, Pl + eps * transform("world", "object", t1), h1, c);
-    solid_texture(S, Pl + eps * transform("world", "object", t2), h2, c);
-    vector g = (t1 * (h1 - h0) + t2 * (h2 - h0)) * (S[ST_BUMP] / eps);
-    Normal = normalize(N - g);
-  }
 }

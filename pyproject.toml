@@ -21,4 +21,4 @@ test = ["pytest"]
 where = ["python"]
 
 [tool.setuptools.package-data]
-rillfacet_cycles = ["*.osl"]
+rillfacet_cycles = ["*.osl", "*.h"]

@@ -20,9 +20,14 @@ How it maps the scene onto Blender, and why:
   roughness, metallic per material slot) that one shared material per slot
   reads, so randomizing appearance never rebuilds a shader. A textured
   slot multiplies its texture by the per-env color.
-- Solid-texture slots (:mod:`rillfacet.solid_texture`) run an OSL port of
-  its families (``solid_texture.osl``) at the Object texture coordinate,
-  which is body-local; each object's parameter rows are 8 more custom
+- Solid- and UV-texture slots (:mod:`rillfacet.solid_texture`,
+  :mod:`rillfacet.uv_texture`) run an OSL port of their families
+  (``texture.osl`` with ``solid_texture.h`` / ``uv_texture.h``) at the
+  Object texture coordinate, which is body-local, or the metric UVs (a UV
+  map ``rf_muv`` beside the image textures' ``UVMap``, with per-face
+  surface gradients of u and v, ``rf_gu`` / ``rf_gv``, for the bump);
+  each object's parameter rows
+  (:func:`rillfacet.uv_texture.render_rows`) are 8 more custom
   properties per slot (``rf_s<slot>_<k>``, 4 floats each, colors linear).
   OSL is on only in scenes that have such slots; Cycles runs it on the CPU
   and on OptiX, not on CUDA, where those slots show their rows' first
@@ -75,7 +80,8 @@ import numpy as np
 from rillfacet.render import Renderer, linear_to_srgb, srgb_to_linear
 from rillfacet.render.camera import PixelRays
 from rillfacet.scene_api import Light
-from rillfacet.solid_texture import PARAM, linearize
+from rillfacet.solid_texture import PARAM
+from rillfacet.uv_texture import render_rows, uv_gradients
 
 __all__ = ["CyclesRenderer"]
 __version__ = "0.1.0"
@@ -87,17 +93,17 @@ _DEFAULT_LIGHTS = (
 )
 _ids = itertools.count()
 
-_OSL_SOURCE = os.path.join(os.path.dirname(__file__), "solid_texture.osl")
+_OSL_SOURCE = os.path.join(os.path.dirname(__file__), "texture.osl")
 _osl_bytecode = None
 
 
-def _solid_texture_bytecode(tmp):
-    """The compiled ``solid_texture.osl`` (OSL bytecode, compiled once per
+def _texture_bytecode(tmp):
+    """The compiled ``texture.osl`` (OSL bytecode, compiled once per
     process)."""
     global _osl_bytecode
     if _osl_bytecode is None:
         import _cycles
-        oso = os.path.join(tmp, "solid_texture.oso")
+        oso = os.path.join(tmp, "texture.oso")
         if not _cycles.osl_compile(_OSL_SOURCE, oso):
             raise RuntimeError(f"cannot compile {_OSL_SOURCE}")
         with open(oso) as f:
@@ -413,12 +419,13 @@ class CyclesRenderer(Renderer):
 
     def _build(self):
         self._clear()
-        solid = any(mat.solid_texture for m in self.meshes.values()
+        solid = any(mat.procedurally_textured for m in self.meshes.values()
                     for mat in m.materials)
         self._osl = solid and (self._device == "CPU"
                                or self._kind == "OPTIX")
         if solid and not self._osl:
-            warnings.warn("CyclesRenderer: solid textures need OSL, which "
+            warnings.warn("CyclesRenderer: solid / UV textures need OSL, "
+                          "which "
                           f"Cycles runs on the CPU and OptiX, not {self._kind}"
                           ": they show their first color c0")
         if self._sc.cycles.shading_system != self._osl:
@@ -436,7 +443,8 @@ class CyclesRenderer(Renderer):
     def _material(self, name, mat, slot, textured):
         """A shared Principled BSDF reading the per-object attributes of
         ``slot`` (and multiplying ``mat``'s texture by its color, or taking
-        color, roughness and maybe the normal from its solid texture)."""
+        color, roughness and maybe the normal from its solid or UV
+        texture)."""
         bpy = self.bpy
         bm = bpy.data.materials.new(name)
         self._blocks.append(bm)
@@ -453,8 +461,8 @@ class CyclesRenderer(Renderer):
             a.attribute_name = f"{prefix}{slot}"
             return a
         nt.links.new(attr("rf_m").outputs["Fac"], bsdf.inputs["Metallic"])
-        if mat is not None and mat.solid_texture and self._osl:
-            st = self._solid_texture_node(nt, slot, mat.bump)
+        if mat is not None and mat.procedurally_textured and self._osl:
+            st = self._texture_node(nt, slot, mat.bump, uv=mat.uv_texture)
             nt.links.new(st.outputs["Color"], bsdf.inputs["Base Color"])
             nt.links.new(st.outputs["Roughness"], bsdf.inputs["Roughness"])
             if mat.bump:
@@ -475,12 +483,13 @@ class CyclesRenderer(Renderer):
         nt.links.new(attr("rf_r").outputs["Fac"], bsdf.inputs["Roughness"])
         return bm
 
-    def _solid_texture_node(self, nt, slot, bump):
-        """``solid_texture.osl`` in ``nt``, at the Object (body-local)
-        coordinate, reading ``slot``'s parameter rows from the object
-        attributes ``rf_s<slot>_<k>`` (Vector: parameters 4k..4k+2, Alpha:
-        4k+3)."""
-        code = _solid_texture_bytecode(self._tmp)
+    def _texture_node(self, nt, slot, bump, uv=False):
+        """``texture.osl`` in ``nt``, at the Object (body-local)
+        coordinate (and, with ``uv``, the metric UV map ``rf_muv`` and the
+        face attributes ``rf_gu`` / ``rf_gv``), reading ``slot``'s parameter
+        rows from the object attributes ``rf_s<slot>_<k>`` (Vector:
+        parameters 4k..4k+2, Alpha: 4k+3)."""
+        code = _texture_bytecode(self._tmp)
         st = nt.nodes.new("ShaderNodeScript")
         st.mode = "INTERNAL"
         st.bytecode = code
@@ -490,7 +499,7 @@ class CyclesRenderer(Renderer):
         # them with, is not importable from the bpy module)
         new_in = lambda kind, n: st.inputs.new(            # noqa: E731
             type=f"NodeSocket{kind}", name=n, identifier=n)
-        for n in ["Pl"] + [f"p{k}" for k in range(8)]:
+        for n in ["Pl", "Uv", "Gu", "Gv"] + [f"p{k}" for k in range(8)]:
             new_in("Vector", n)
         for k in range(8):
             new_in("Float", f"w{k}")
@@ -500,6 +509,13 @@ class CyclesRenderer(Renderer):
             st.outputs.new(type=f"NodeSocket{kind}", name=n, identifier=n)
         tc = nt.nodes.new("ShaderNodeTexCoord")
         nt.links.new(tc.outputs["Object"], st.inputs["Pl"])
+        if uv:
+            for sock, name in (("Uv", "rf_muv"), ("Gu", "rf_gu"),
+                               ("Gv", "rf_gv")):
+                a = nt.nodes.new("ShaderNodeAttribute")
+                a.attribute_type = "GEOMETRY"
+                a.attribute_name = name
+                nt.links.new(a.outputs["Vector"], st.inputs[sock])
         for k in range(8):
             a = nt.nodes.new("ShaderNodeAttribute")
             a.attribute_type = "OBJECT"
@@ -571,6 +587,17 @@ class CyclesRenderer(Renderer):
                 uv[:, 1] = 1.0 - uv[:, 1]            # glTF's v is top-down
                 layer = me.uv_layers.new(name="UVMap")
                 layer.data.foreach_set("uv", uv.ravel())
+            if (m.metric_uvs is not None and mats
+                    and any(mats[int(s)].uv_texture for s in used)):
+                muv = np.nan_to_num(m.metric_uvs[gv], nan=0.0)
+                layer = me.uv_layers.new(name="rf_muv")
+                layer.data.foreach_set(
+                    "uv", muv[inv].astype(np.float32).ravel())
+                gu, gvec = uv_gradients(m.local_vertices[gv],
+                                        inv.reshape(-1, 3), muv)
+                for name, g in (("rf_gu", gu), ("rf_gv", gvec)):
+                    at = me.attributes.new(name, "FLOAT_VECTOR", "FACE")
+                    at.data.foreach_set("vector", g.ravel())
             me.update(calc_edges=True)
             # Flat unless normals are given (Blender >= 4.1 meshes are
             # smooth by default).
@@ -681,12 +708,15 @@ class CyclesRenderer(Renderer):
                                               np.float32))
             rough = np.asarray(m.material_roughness, np.float32)
             metal = np.asarray(m.material_metallic, np.float32)
-            solid = {s for s, mat in enumerate(m.materials)
-                     if mat.solid_texture}
+            tslots, rr = render_rows(m)
+            solid = set(tslots)
             if solid:
-                rows = linearize(m.material_solid_texture)
+                rows = np.zeros((I, len(m.materials), rr.shape[-1]),
+                                np.float32)
+                rows[:, tslots] = rr
                 if not self._osl:            # c0, rough0 instead
-                    mask = np.array([mat.solid_texture for mat in m.materials])
+                    mask = np.zeros(len(m.materials), bool)
+                    mask[tslots] = True
                     k = PARAM["c0"]
                     color = np.where(mask[:, None], rows[..., k:k + 3], color)
                     rough = np.where(mask, rows[..., PARAM["rough0"]], rough)

@@ -289,12 +289,13 @@ def test_background_panoramas(renderer):
 
 # -- solid (3D) textures --------------------------------------------------------
 
-def _osl_eval(r, points, rows):
-    """``solid_texture.osl`` evaluated by Cycles at body-local ``points``
+def _osl_eval(r, points, rows, uv=False):
+    """``texture.osl`` evaluated by Cycles at body-local ``points``
     ``[n, T * T, 3]`` (in the plane z = const per n) with rows ``[n, K]``:
     ``(h, rough, linear rgb)``, each ``[n, T * T(, 3)]``. One object per
     row, a T x T pixel tile of an orthographic view, emitting the shader's
-    outputs at the pixel centers."""
+    outputs at the pixel centers. ``uv``: UV-texture rows (as stored),
+    their metric UVs the points' (x, y)."""
     import os
     from rillfacet.solid_texture import linearize
     n, TT, _ = points.shape
@@ -323,12 +324,16 @@ def _osl_eval(r, points, rows):
         mat = bpy.data.materials.new("rf_test_mat")
         nt = mat.node_tree
         nt.nodes.clear()
-        st = r._solid_texture_node(nt, 0, False)
+        st = r._texture_node(nt, 0, False, uv=uv)
         em = nt.nodes.new("ShaderNodeEmission")
         nt.links.new(em.outputs[0],
                      nt.nodes.new("ShaderNodeOutputMaterial").inputs["Surface"])
         blocks += [cam, cob, sc.world, mat]
-        lin = linearize(rows).reshape(n, 8, 4)
+        lin = linearize(rows)
+        if uv:
+            from rillfacet.uv_texture import RENDER_FAMILY_OFFSET
+            lin[:, 0] += RENDER_FAMILY_OFFSET
+        lin = lin.reshape(n, 8, 4)
         lo = points[:, :, :2].min(1)                   # tile corner, body-local
         for k in range(n):
             gx, gy = k % G, k // G
@@ -338,6 +343,11 @@ def _osl_eval(r, points, rows):
             s = T * px
             me.from_pydata([(x0, y0, z), (x0 + s, y0, z), (x0 + s, y0 + s, z),
                             (x0, y0 + s, z)], [], [(0, 1, 2, 3)])
+            if uv:
+                layer = me.uv_layers.new(name="rf_muv")
+                layer.data.foreach_set("uv", np.array(
+                    [x0, y0, x0 + s, y0, x0 + s, y0 + s, x0, y0 + s],
+                    np.float32))
             me.materials.append(mat)
             ob = bpy.data.objects.new(f"rf_test_q{k}", me)
             ob.location = (gx * s - x0, gy * s - y0, -z)
@@ -401,6 +411,82 @@ def test_solid_texture_osl_matches_the_reference(renderer):
         assert float((e > 1e-3).float().mean()) < 2e-3, name
         assert float(e.median()) < 1e-5, name
     assert np.allclose(rough, 0.2 + 0.7 * h, atol=1e-5)
+
+
+def test_uv_texture_osl_matches_the_reference(renderer):
+    """The OSL port of the UV textures evaluates the same functions as the
+    torch reference (rillfacet.uv_texture.evaluate), every family."""
+    from rillfacet import uv_texture as ut
+    rng = np.random.default_rng(0)
+    T, px = 16, 0.01
+    fams = ut.FAMILIES[1:]
+    rows = np.concatenate([ut.sample_params(rng, 6, families=(f,),
+                                            scale=(20, 60)) for f in fams])
+    n = len(rows)
+    rows[:, ut.PARAM["rough0"]], rows[:, ut.PARAM["rough1"]] = 0.2, 0.9
+    corner = rng.uniform(-0.3, 0.1, (n, 1, 2))
+    u, v = np.meshgrid(np.arange(T), np.arange(T), indexing="xy")
+    uv = (np.stack([u, v], -1).reshape(1, -1, 2) + 0.5) * px
+    pts = np.concatenate([corner + uv, np.zeros((n, T * T, 1))], -1)
+    h, rough, rgb = _osl_eval(renderer, pts.astype(np.float32), rows, uv=True)
+    got = torch.as_tensor(np.concatenate([h[..., None], rgb], -1)).reshape(-1, 4)
+    pt = torch.as_tensor(pts[..., :2], dtype=torch.float32).reshape(-1, 2)
+    rt = torch.as_tensor(np.repeat(rows, T * T, 0))
+    hr, cr = ut.evaluate(pt, rt)
+    err = (got - torch.cat([hr[:, None], cr], -1)).abs().max(-1).values
+    fam = rt[:, ut.PARAM["family"]]
+    for f, name in enumerate(fams, 1):
+        e = err[fam == f]
+        assert len(e), name
+        # shape edges / lattice ties at the pixel centers; Cycles
+        # interpolates the UVs in fp32, which the fine fibers of weave and
+        # twill (up to 12 per pattern unit) amplify
+        assert float((e > 1e-3).float().mean()) < 5e-3, name
+        fine = name in ("weave", "twill")
+        assert float(e.median()) < (1e-4 if fine else 1e-5), name
+    assert np.allclose(rough, 0.2 + 0.7 * h, atol=1e-5)
+
+
+def test_uv_textures_match_mitsuba():
+    """Bumped UV textures on primitives (with a solid slot) against
+    rillfacet's Mitsuba backend: the same image up to noise."""
+    pytest.importorskip("mitsuba")
+    from rillfacet import primitives as pr
+    from rillfacet import solid_texture as sx
+    from rillfacet import uv_texture as ut
+    from rillfacet.assets import merge_bodies
+    from rillfacet.render.mitsuba import MitsubaRenderer
+    rng = np.random.default_rng(5)
+    urows = ut.sample_params(rng, (2, 4), scale=(10, 20), bump=(0.001, 0.003))
+    srows = sx.sample_params(rng, (2, 4))
+    imgs = []
+    for R in (CyclesRenderer(spp=64), MitsubaRenderer(spp=64)):
+        mats = [Material("floor", (0.5, 0.5, 0.5))] + [
+            Material(n, uv_texture=True, solid_texture=n == "c", bump=True)
+            for n in ("a", "b", "c")]
+        s = Scene(R)
+        m = s.rigid_mesh("p", instances=2, **merge_bodies(
+            [pr.box((0.8, 0.8, 0.02), material=mats[0]),
+             pr.box((0.2, 0.2, 0.2), material=mats[1]),
+             pr.sphere(0.1, material=mats[2]),
+             pr.cylinder(0.06, 0.2, material=mats[3])]))
+        poses = np.zeros((2, 4, 7), np.float32)
+        poses[..., 6] = 1
+        poses[:, :, :3] = [[0, 0, -0.01], [-0.15, -0.1, 0.1],
+                           [0.15, -0.1, 0.1], [0, 0.17, 0.1]]
+        m.set_poses(poses)
+        m.set_materials(uv_texture=urows, solid_texture=srows)
+        s.light("sky", "ambient", intensity=0.4)
+        s.light("sun", "directional", direction=(0.3, 0.4, -1), intensity=3.0)
+        s.camera_sensor("cam", 96, 72, _pinhole(96, 72, 90.0), instances=2,
+                        local_pose=look_at((0.45, -0.55, 0.45), (0, 0, 0.08),
+                                           up=(0, 0, 1)))
+        imgs.append(R.render("cam", outputs=("linear",))["linear"].float().cpu())
+        if isinstance(R, CyclesRenderer):
+            R.close()
+    d = (imgs[0] - imgs[1]).abs().amax(-1)
+    assert float(d.median()) < 0.02
+    assert float((d > 0.1).float().mean()) < 0.03
 
 
 def _solid_scene(renderer, solid, *, bump=False, instances=2,

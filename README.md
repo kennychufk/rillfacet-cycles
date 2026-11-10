@@ -47,11 +47,17 @@ Procedural solid (3D) textures (`Material(..., solid_texture=True, bump=...)`,
 `mesh.set_materials(solid_texture=rillfacet.solid_texture.sample_params(rng,
 (E, M)))`: wood, marble, granite, stone, checker, randomized per env) render
 as in rillfacet's Mitsuba and raster backends, through an OSL port of
-`rillfacet.solid_texture` (`python/rillfacet_cycles/solid_texture.osl`)
-checked against its torch reference. Cycles runs OSL on the CPU and on OptiX
+`rillfacet.solid_texture` (`python/rillfacet_cycles/solid_texture.h`)
+checked against its torch reference. So do procedural UV (2D) textures
+(`Material(..., uv_texture=True)`, `rillfacet.uv_texture`: stripes, tiles,
+fabric, labels, ... at the mesh's metric UVs), through `uv_texture.h`; both
+kinds go through one shader, `texture.osl`, which reads each env's row
+(`rillfacet.uv_texture.render_rows`), the metric UVs (a UV map `rf_muv`)
+and, for a UV bump, the faces' surface gradients of u and v (face
+attributes `rf_gu` / `rf_gv`). Cycles runs OSL on the CPU and on OptiX
 only (on CUDA these slots show their first color); the first OptiX render
 with OSL compiles Cycles' OSL kernels once (~90 s, then cached on disk). A
-scene with solid textures shades everything through OSL: ~1.25x the time of
+scene with solid or UV textures shades everything through OSL: ~1.25x the time of
 SVM (a cube on a floor, 16 envs, 320 x 180, 16 spp, RGB + depth +
 segmentation: 12.3 vs 9.7 ms per env); the patterns, and their bump, add
 little on top.
