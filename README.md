@@ -1,5 +1,11 @@
 # rillfacet-cycles
 
+> **Archived.** This package was merged into
+> [rillfacet](https://github.com/kennychufk/rillfacet) 0.2.0 as
+> `rillfacet.render.cycles`. Install it with `pip install rillfacet[cycles]` and
+> import `from rillfacet.render.cycles import CyclesRenderer`. rillfacet is now
+> GPL-3.0-or-later as well. This repository is read-only and no longer maintained.
+
 A [Blender Cycles](https://www.cycles-renderer.org/) camera renderer backend
 for [rillfacet](https://github.com/kennychufk/rillfacet) scenes: RGB, z-depth
 and segmentation of every env's camera, as torch tensors, for vision-based RL
